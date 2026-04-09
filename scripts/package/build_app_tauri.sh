@@ -153,46 +153,53 @@ if [ -n "$APPLE_PERSONALID" ]; then
             --sign "$APPLE_PERSONALID" \
             "$fw" 2>&1) && echo "  Signed bundle: $fw" || {
             if echo "$sign_output" | grep -q "bundle format is ambiguous"; then
-                echo "  Note: $fw lacks standard bundle structure; signing all Mach-O binaries inside via temp copy"
+                echo "  Note: $fw lacks standard bundle structure; signing canonical binary once and syncing to duplicates"
                 # PyInstaller copies Python.framework contents as separate files rather
                 # than symlinks — Python, Versions/Current/Python, and Versions/3.9/Python
-                # are distinct inodes. Signing only $fw_name leaves the Versions/ copies
-                # unsigned, causing Apple notarization to reject every affected watcher.
-                # Sign every Mach-O file inside the framework via a temp-path copy to
-                # avoid the in-place "bundle format is ambiguous" error from codesign.
-                signed_count=0
+                # are distinct inodes with identical code content. Signing each independently
+                # produces different signature blocks (different timestamps/nonces in
+                # __LINKEDIT), making Apple's notarization service report "The signature of
+                # the binary is invalid" for ALL paths — even though each individual
+                # signature is technically valid. Fix: sign only the canonical (first) binary
+                # once via temp copy, then cp the signed result to all duplicate paths so
+                # they end up byte-identical including the embedded signature.
+                canonical=""
+                unsigned_ref=""
                 while IFS= read -r fw_bin; do
-                    echo "    Signing framework binary via temp copy: $fw_bin"
-                    # Preserve the binary's existing code-signing identifier.
-                    # Without --identifier, codesign uses the random temp filename
-                    # (e.g. "tmp.XXXXXX") as the identifier, which makes Apple's
-                    # notarization service report "The signature of the binary is
-                    # invalid" — even though the certificate chain and code hashes
-                    # are valid. Using the original identifier (e.g. "org.python.python"
-                    # from PyInstaller's codesign_identity step) or falling back to the
-                    # binary's filename avoids this rejection.
-                    existing_id=$(codesign -d "$fw_bin" 2>&1 \
-                        | sed -n 's/^Identifier=//p' || true)
-                    if [ -z "$existing_id" ]; then
-                        existing_id=$(basename "$fw_bin")
+                    if [ -z "$canonical" ]; then
+                        canonical="$fw_bin"
+                        echo "    Canonical binary: $canonical"
+                        # Save unsigned content for duplicate detection before signing
+                        unsigned_ref=$(mktemp)
+                        cp -p "$canonical" "$unsigned_ref"
+                        tmp_binary=$(mktemp)
+                        cp -p "$canonical" "$tmp_binary"
+                        sign_binary "$tmp_binary"
+                        cp -p "$tmp_binary" "$canonical"
+                        rm -f "$tmp_binary"
+                    else
+                        # Only copy the signed canonical over duplicates with identical
+                        # unsigned content. If a binary genuinely differs (e.g. a helper
+                        # tool), sign it separately via its own temp-copy pass.
+                        if cmp -s "$fw_bin" "$unsigned_ref"; then
+                            echo "    Syncing signed canonical to duplicate: $fw_bin"
+                            cp -p "$canonical" "$fw_bin"
+                        else
+                            echo "    Signing distinct binary via temp copy: $fw_bin"
+                            tmp_distinct=$(mktemp)
+                            cp -p "$fw_bin" "$tmp_distinct"
+                            sign_binary "$tmp_distinct"
+                            cp -p "$tmp_distinct" "$fw_bin"
+                            rm -f "$tmp_distinct"
+                        fi
                     fi
-                    echo "      Using identifier: $existing_id"
-                    tmp_binary=$(mktemp)
-                    cp "$fw_bin" "$tmp_binary"
-                    codesign --force --options runtime --timestamp \
-                        --entitlements "$ENTITLEMENTS" \
-                        --identifier "$existing_id" \
-                        --sign "$APPLE_PERSONALID" \
-                        "$tmp_binary" || { rm -f "$tmp_binary"; exit 1; }
-                    cp "$tmp_binary" "$fw_bin" || { rm -f "$tmp_binary"; exit 1; }
-                    rm -f "$tmp_binary"
-                    signed_count=$((signed_count + 1))
                 done < <(find "$fw" -type f | xargs file | grep "Mach-O" | cut -d: -f1)
-                if [ "$signed_count" -eq 0 ]; then
+                rm -f "$unsigned_ref"
+                if [ -z "$canonical" ]; then
                     echo "ERROR: No Mach-O binaries found inside $fw" >&2
                     exit 1
                 fi
-                echo "  Signed $signed_count Mach-O binary/binaries inside $fw"
+                echo "  Signed canonical binary and synced to duplicates inside $fw"
             else
                 echo "ERROR: Failed to sign $fw: $sign_output" >&2
                 exit 1
