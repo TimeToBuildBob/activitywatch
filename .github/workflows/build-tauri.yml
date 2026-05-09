@@ -203,6 +203,8 @@ jobs:
           if [ -n "$DEB" ]; then
             cp "$DEB" "dist/activitywatch-tauri-${VERSION_WITH_V}-linux-$(uname -m).deb"
             echo "Packaged deb: dist/activitywatch-tauri-${VERSION_WITH_V}-linux-$(uname -m).deb"
+          else
+            echo "Warning: no deb found in dist/activitywatch/aw-tauri/"
           fi
 
       - name: Upload packages
