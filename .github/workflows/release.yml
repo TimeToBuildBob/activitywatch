@@ -294,6 +294,10 @@ jobs:
       - name: Determine and output version
         run: |
           VERSION_WITH_V=$(bash scripts/package/getversion.sh)
+          # Strip the research tag suffix for filenames: the edition gets its
+          # own token (activitywatch[-tauri][-research]-<version>-...), so the
+          # version part stays a plain version.
+          VERSION_WITH_V="${VERSION_WITH_V%-research}"
           VERSION_NO_V="${VERSION_WITH_V#v}"
           echo "VERSION_WITH_V=${VERSION_WITH_V}" >> "$GITHUB_ENV"
           echo "========================================"
@@ -304,6 +308,41 @@ jobs:
           echo "Version (with v):  ${VERSION_WITH_V}"
           echo "Version (no v):     ${VERSION_NO_V}"
           echo "========================================"
+
+      - name: Verify aw-server-rust submodule version matches release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Fail fast if the aw-server-rust submodule is pinned to an older
+          # release line than the one we're tagging. The Windows 0.14 Tauri
+          # bundle shipped with aw-server-rust v0.13.1 (activitywatch#1380);
+          # catch the same class of mismatch here before spending ~30 min on a
+          # full Tauri build.
+          #
+          # The bundled binary's version lives in
+          # aw-server-rust/aw-server/Cargo.toml (the workspace-level
+          # aw-server-rust/Cargo.toml has no [package].version field).
+          BUNDLED_VERSION=$(grep -m1 '^version = ' aw-server-rust/aw-server/Cargo.toml | sed -E 's/^version = "(.*)".*/\1/')
+          if [ -z "$BUNDLED_VERSION" ]; then
+            echo "ERROR: could not read aw-server version from aw-server-rust/aw-server/Cargo.toml" >&2
+            exit 1
+          fi
+
+          AW_VERSION="${VERSION_NO_V}"  # e.g. "0.14.0b3"
+          AW_MAJOR_MINOR=$(echo "$AW_VERSION" | cut -d'.' -f1-2)  # "0.14"
+          AWS_MAJOR_MINOR=$(echo "$BUNDLED_VERSION" | cut -d'.' -f1-2)  # "0.14"
+
+          echo "AW release tag:       ${AW_VERSION} (major.minor: ${AW_MAJOR_MINOR})"
+          echo "Bundled aw-server:    ${BUNDLED_VERSION} (major.minor: ${AWS_MAJOR_MINOR})"
+
+          if [ "$AW_MAJOR_MINOR" != "$AWS_MAJOR_MINOR" ]; then
+            echo ""
+            echo "ERROR: aw-server-rust major.minor (${AWS_MAJOR_MINOR}) does not match"
+            echo "       AW release major.minor (${AW_MAJOR_MINOR})."
+            echo "       The aw-server-rust submodule is stale for this tag."
+            echo "       Update the submodule (cd aw-server-rust && git pull) and re-tag."
+            exit 1
+          fi
+          echo "OK: aw-server version ${BUNDLED_VERSION} is consistent with AW release ${AW_VERSION}"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -437,9 +476,9 @@ jobs:
 
             make dist/notarize
           fi
-          EDITION_SUFFIX=""
-          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION_SUFFIX="-research-edition"; fi
-          mv dist/ActivityWatch.dmg dist/activitywatch-${VERSION_WITH_V}-macos-$(uname -m)${EDITION_SUFFIX}.dmg
+          EDITION=""
+          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION="-research"; fi
+          mv dist/ActivityWatch.dmg dist/activitywatch${EDITION}-${VERSION_WITH_V}-macos-$(uname -m).dmg
         env:
           APPLE_EMAIL: ${{ secrets.APPLE_EMAIL }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -450,21 +489,11 @@ jobs:
 
       - name: Package AppImage
         if: startsWith(runner.os, 'linux')
-        run: |
-          ./scripts/package/package-appimage.sh
-          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then
-            mv dist/activitywatch-linux-x86_64.AppImage \
-              dist/activitywatch-linux-x86_64-research-edition.AppImage
-          fi
+        run: ./scripts/package/package-appimage.sh
 
       - name: Package deb
         if: startsWith(runner.os, 'linux')
-        run: |
-          ./scripts/package/package-deb.sh
-          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then
-            deb="dist/activitywatch-${VERSION_WITH_V}-linux-x86_64.deb"
-            mv "$deb" "${deb%.deb}-research-edition.deb"
-          fi
+        run: ./scripts/package/package-deb.sh
 
       - name: Upload packages
         uses: actions/upload-artifact@v7
@@ -525,6 +554,10 @@ jobs:
       - name: Determine and output version
         run: |
           VERSION_WITH_V=$(bash scripts/package/getversion.sh)
+          # Strip the research tag suffix for filenames: the edition gets its
+          # own token (activitywatch[-tauri][-research]-<version>-...), so the
+          # version part stays a plain version.
+          VERSION_WITH_V="${VERSION_WITH_V%-research}"
           VERSION_NO_V="${VERSION_WITH_V#v}"
           echo "VERSION_WITH_V=${VERSION_WITH_V}" >> "$GITHUB_ENV"
           echo "========================================"
@@ -535,6 +568,41 @@ jobs:
           echo "Version (with v):  ${VERSION_WITH_V}"
           echo "Version (no v):     ${VERSION_NO_V}"
           echo "========================================"
+
+      - name: Verify aw-server-rust submodule version matches release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Fail fast if the aw-server-rust submodule is pinned to an older
+          # release line than the one we're tagging. The Windows 0.14 Tauri
+          # bundle shipped with aw-server-rust v0.13.1 (activitywatch#1380);
+          # catch the same class of mismatch here before spending ~30 min on a
+          # full Tauri build.
+          #
+          # The bundled binary's version lives in
+          # aw-server-rust/aw-server/Cargo.toml (the workspace-level
+          # aw-server-rust/Cargo.toml has no [package].version field).
+          BUNDLED_VERSION=$(grep -m1 '^version = ' aw-server-rust/aw-server/Cargo.toml | sed -E 's/^version = "(.*)".*/\1/')
+          if [ -z "$BUNDLED_VERSION" ]; then
+            echo "ERROR: could not read aw-server version from aw-server-rust/aw-server/Cargo.toml" >&2
+            exit 1
+          fi
+
+          AW_VERSION="${VERSION_NO_V}"  # e.g. "0.14.0b3"
+          AW_MAJOR_MINOR=$(echo "$AW_VERSION" | cut -d'.' -f1-2)  # "0.14"
+          AWS_MAJOR_MINOR=$(echo "$BUNDLED_VERSION" | cut -d'.' -f1-2)  # "0.14"
+
+          echo "AW release tag:       ${AW_VERSION} (major.minor: ${AW_MAJOR_MINOR})"
+          echo "Bundled aw-server:    ${BUNDLED_VERSION} (major.minor: ${AWS_MAJOR_MINOR})"
+
+          if [ "$AW_MAJOR_MINOR" != "$AWS_MAJOR_MINOR" ]; then
+            echo ""
+            echo "ERROR: aw-server-rust major.minor (${AWS_MAJOR_MINOR}) does not match"
+            echo "       AW release major.minor (${AW_MAJOR_MINOR})."
+            echo "       The aw-server-rust submodule is stale for this tag."
+            echo "       Update the submodule (cd aw-server-rust && git pull) and re-tag."
+            exit 1
+          fi
+          echo "OK: aw-server version ${BUNDLED_VERSION} is consistent with AW release ${AW_VERSION}"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -669,13 +737,13 @@ jobs:
           # `dist/activitywatch-*.*` upload pattern below.
           ARCH=$(uname -m)
           shopt -s nullglob
-          EDITION_SUFFIX=""
-          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION_SUFFIX="-research-edition"; fi
+          EDITION=""
+          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION="-research"; fi
           for ext in AppImage deb rpm; do
             files=( dist/activitywatch/aw-tauri/*.${ext} )
             case ${#files[@]} in
               0) continue ;;
-              1) cp -v "${files[0]}" "dist/activitywatch-tauri-${VERSION_WITH_V}-linux-${ARCH}${EDITION_SUFFIX}.${ext}" ;;
+              1) cp -v "${files[0]}" "dist/activitywatch-tauri${EDITION}-${VERSION_WITH_V}-linux-${ARCH}.${ext}" ;;
               *) echo "ERROR: expected at most 1 .${ext} bundle, found ${#files[@]}" >&2; exit 1 ;;
             esac
           done
@@ -700,9 +768,9 @@ jobs:
 
             make dist/notarize
           fi
-          EDITION_SUFFIX=""
-          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION_SUFFIX="-research-edition"; fi
-          mv dist/ActivityWatch.dmg dist/activitywatch-tauri-${VERSION_WITH_V}-macos-$(uname -m)${EDITION_SUFFIX}.dmg
+          EDITION=""
+          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION="-research"; fi
+          mv dist/ActivityWatch.dmg dist/activitywatch-tauri${EDITION}-${VERSION_WITH_V}-macos-$(uname -m).dmg
         env:
           APPLE_EMAIL: ${{ secrets.APPLE_EMAIL }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -784,7 +852,7 @@ jobs:
           mv release_notes_research.md release_notes.md
           # The generated Downloads section hardcodes standard-edition asset
           # filenames, which do not exist on research releases (research
-          # artifacts carry a research-edition suffix). Point at the asset
+          # artifacts carry a -research token). Point at the asset
           # list instead of linking to 404s.
           python3 - <<'PY'
           import re
