@@ -443,18 +443,16 @@ jobs:
       - name: Package dmg
         if: runner.os == 'macOS'
         run: |
+          # Separate assignment (not inlined into `[ ... ]`) so that `set -e`
+          # still aborts the step when the script exits non-zero, i.e. when a
+          # tagged release is missing its signing secrets.
+          SIGN_MODE=$(./scripts/ci/macos-signing-mode.sh)
           SIGN_MACOS=false
-          if [[ "${GITHUB_REF:-}" == refs/tags/v* || "$AW_RESEARCH_EDITION" == "true" ]]; then
+          if [ "$SIGN_MODE" = "sign" ]; then
             SIGN_MACOS=true
           fi
 
           if [ "$SIGN_MACOS" = true ]; then
-            for var in APPLE_EMAIL APPLE_PASSWORD APPLE_TEAMID CERTIFICATE_MACOS_P12_BASE64 CERTIFICATE_MACOS_P12_PASSWORD; do
-              if [ -z "${!var:-}" ]; then
-                echo "ERROR: $var is required to sign macOS release artifacts" >&2
-                exit 1
-              fi
-            done
             ./scripts/ci/import-macos-p12.sh
             APPLE_PERSONALID=$(security find-identity -v -p codesigning "${KEY_CHAIN:-build.keychain-db}" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)
             if [ -z "$APPLE_PERSONALID" ]; then
@@ -702,12 +700,11 @@ jobs:
       - name: Import macOS signing certificate
         if: runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/v') || env.AW_RESEARCH_EDITION == 'true')
         run: |
-          for var in APPLE_EMAIL APPLE_PASSWORD APPLE_TEAMID CERTIFICATE_MACOS_P12_BASE64 CERTIFICATE_MACOS_P12_PASSWORD; do
-            if [ -z "${!var:-}" ]; then
-              echo "ERROR: $var is required to sign macOS release artifacts" >&2
-              exit 1
-            fi
-          done
+          SIGN_MODE=$(./scripts/ci/macos-signing-mode.sh)
+          if [ "$SIGN_MODE" != "sign" ]; then
+            echo "Skipping macOS certificate import (signing mode: $SIGN_MODE)"
+            exit 0
+          fi
           ./scripts/ci/import-macos-p12.sh
           APPLE_PERSONALID=$(security find-identity -v -p codesigning "${KEY_CHAIN:-build.keychain-db}" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)
           if [ -z "$APPLE_PERSONALID" ]; then
@@ -751,8 +748,13 @@ jobs:
       - name: Package dmg
         if: runner.os == 'macOS'
         run: |
+          # The "Import macOS signing certificate" step above exports
+          # APPLE_PERSONALID only when signing actually succeeded, so its
+          # presence is the authoritative signal here. This step does not
+          # receive the CERTIFICATE_* secrets, so it must not re-derive the
+          # signing mode itself.
           SIGN_MACOS=false
-          if [[ "${GITHUB_REF:-}" == refs/tags/v* || "$AW_RESEARCH_EDITION" == "true" ]]; then
+          if [ -n "${APPLE_PERSONALID:-}" ]; then
             SIGN_MACOS=true
           fi
 
