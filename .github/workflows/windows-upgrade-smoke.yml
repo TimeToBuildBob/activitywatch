@@ -69,12 +69,14 @@ jobs:
             if (-not $ready) { throw "v0.14.0b5 server failed to expose buckets`n$(Get-Content $err -Raw)" }
             $elapsed = ((Get-Date) - $started).TotalMilliseconds
             $buckets = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/'
-            $events = @(Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events')
+            $events = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events'
+            $eventCount = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events/count'
             $setting = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/settings/upgrade-smoke'
             if (-not $buckets.'upgrade-smoke') { throw 'bucket missing after upgrade' }
             if ($buckets.'upgrade-smoke'.data.sentinel -ne 'bucket-metadata') { throw 'bucket metadata missing after upgrade' }
-            if ($events.Count -ne 2) { throw "event count after upgrade was $($events.Count), expected 2" }
-            if (($events.data.title | Sort-Object) -join ',' -ne 'before-upgrade,preserve-me') { throw 'event payloads changed after upgrade' }
+            if ($eventCount -ne 2) { throw "event count after upgrade was $eventCount, expected 2" }
+            $titles = @($events | ForEach-Object { $_.data.title } | Sort-Object)
+            if ($titles -join ',' -ne 'before-upgrade,preserve-me') { throw "event payloads changed after upgrade: $($titles -join ',')" }
             if ($setting.sentinel -ne 'setting-preserved') { throw 'setting missing after upgrade' }
             $summary = [ordered]@{
               old_version = 'v0.13.2'
@@ -85,7 +87,7 @@ jobs:
               new_db_bytes = (Get-Item $db).Length
               bucket_preserved = $true
               bucket_metadata_preserved = $true
-              events_preserved = $events.Count
+              events_preserved = $eventCount
               event_payloads_preserved = $true
               setting_preserved = $true
             }
