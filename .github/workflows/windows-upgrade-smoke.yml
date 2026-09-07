@@ -46,7 +46,7 @@ jobs:
             if ($count -ne 2) { throw "v0.13.2 event count was $count, expected 2" }
             # Bulk up this real v4 datastore so the Windows v5 index rebuild
             # measures a nontrivial profile rather than only schema migration.
-            @'
+            $py = @'
             import sqlite3, sys
             p = sys.argv[1]
             count = 250_000
@@ -56,7 +56,9 @@ jobs:
                 rows = ((bucketrow, base + i * 1_000_000_000, base + i * 1_000_000_000 + 500_000_000, '{"app":"bulk-sentinel","title":"preserve-bulk"}') for i in range(count))
                 db.executemany("INSERT INTO events(bucketrow,starttime,endtime,data) VALUES (?,?,?,?)", rows)
             print(count)
-            '@ | python - $db
+            '@
+            $py = ($py -split "`n" | ForEach-Object { $_ -replace '^            ', '' }) -join "`n"
+            $py | python - $db
             $count = Invoke-RestMethod 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events/count'
             if ($count -ne 250002) { throw "v0.13.2 bulk event count was $count, expected 250002" }
           } finally {
