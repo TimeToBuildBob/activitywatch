@@ -1,0 +1,109 @@
+name: Windows v0.13.2 to v0.14.0b5 upgrade smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download release archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest 'https://github.com/ActivityWatch/activitywatch/releases/download/v0.13.2/activitywatch-v0.13.2-windows-x86_64.zip' -OutFile old.zip
+          Invoke-WebRequest 'https://github.com/ActivityWatch/activitywatch/releases/download/v0.14.0b5/activitywatch-v0.14.0b5-windows-x86_64.zip' -OutFile new.zip
+          Expand-Archive old.zip -DestinationPath old
+          Expand-Archive new.zip -DestinationPath new
+
+      - name: Create v4 datastore with v0.13.2 Windows binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $db = Join-Path $PWD 'upgrade.sqlite.db'
+          $old = Join-Path $PWD 'old/activitywatch/aw-server-rust/aw-server-rust.exe'
+          $log = Join-Path $PWD 'old-server.log'
+          $p = Start-Process $old -ArgumentList '--dbpath', $db, '--host', '127.0.0.1', '--port', '5667', '--no-legacy-import' -PassThru -RedirectStandardOutput $log -RedirectStandardError old-server.err.log
+          try {
+            $ready = $false
+            foreach ($i in 1..120) {
+              try { Invoke-RestMethod 'http://127.0.0.1:5667/api/0/info' | Out-Null; $ready = $true; break } catch { Start-Sleep -Milliseconds 250 }
+            }
+            if (-not $ready) { throw "v0.13.2 server failed to start`n$(Get-Content old-server.err.log -Raw)" }
+            $bucket = @{ id='upgrade-smoke'; type='currentwindow'; client='upgrade-smoke'; hostname='windows-runner'; data=@{sentinel='bucket-metadata'} } | ConvertTo-Json -Depth 4
+            Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke' -ContentType 'application/json' -Body $bucket | Out-Null
+            $events = @(
+              @{ timestamp='2026-01-01T00:00:00Z'; duration=60.5; data=@{app='sentinel-app'; title='before-upgrade'} },
+              @{ timestamp='2026-01-01T00:02:00Z'; duration=30.25; data=@{app='sentinel-app-2'; title='preserve-me'} }
+            ) | ConvertTo-Json -Depth 4
+            Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events' -ContentType 'application/json' -Body $events | Out-Null
+            Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/settings/upgrade-smoke' -ContentType 'application/json' -Body '{"sentinel":"setting-preserved"}' | Out-Null
+            $count = Invoke-RestMethod 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events/count'
+            if ($count -ne 2) { throw "v0.13.2 event count was $count, expected 2" }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
+          }
+          if (-not (Test-Path $db)) { throw 'v0.13.2 did not create datastore' }
+          "OLD_DB_BYTES=$((Get-Item $db).Length)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upgrade same datastore with v0.14.0b5 Windows binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $db = Join-Path $PWD 'upgrade.sqlite.db'
+          $new = Join-Path $PWD 'new/activitywatch/aw-server-rust/aw-server-rust.exe'
+          $out = Join-Path $PWD 'new-server.log'
+          $err = Join-Path $PWD 'new-server.err.log'
+          $started = Get-Date
+          $p = Start-Process $new -ArgumentList '--dbpath', $db, '--host', '127.0.0.1', '--port', '5668', '--no-legacy-import' -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          try {
+            $ready = $false
+            foreach ($i in 1..240) {
+              try { Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/' | Out-Null; $ready = $true; break } catch { Start-Sleep -Milliseconds 250 }
+            }
+            if (-not $ready) { throw "v0.14.0b5 server failed to expose buckets`n$(Get-Content $err -Raw)" }
+            $elapsed = ((Get-Date) - $started).TotalMilliseconds
+            $buckets = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/'
+            $events = @(Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events')
+            $setting = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/settings/upgrade-smoke'
+            if (-not $buckets.'upgrade-smoke') { throw 'bucket missing after upgrade' }
+            if ($buckets.'upgrade-smoke'.data.sentinel -ne 'bucket-metadata') { throw 'bucket metadata missing after upgrade' }
+            if ($events.Count -ne 2) { throw "event count after upgrade was $($events.Count), expected 2" }
+            if (($events.data.title | Sort-Object) -join ',' -ne 'before-upgrade,preserve-me') { throw 'event payloads changed after upgrade' }
+            if ($setting.sentinel -ne 'setting-preserved') { throw 'setting missing after upgrade' }
+            $summary = [ordered]@{
+              old_version = 'v0.13.2'
+              new_version = 'v0.14.0b5'
+              windows_runner = $env:RUNNER_IMAGE
+              migration_ms = [math]::Round($elapsed)
+              old_db_bytes = [int64]$env:OLD_DB_BYTES
+              new_db_bytes = (Get-Item $db).Length
+              bucket_preserved = $true
+              bucket_metadata_preserved = $true
+              events_preserved = $events.Count
+              event_payloads_preserved = $true
+              setting_preserved = $true
+            }
+            $summary | ConvertTo-Json | Tee-Object upgrade-summary.json
+            Get-Content $err -ErrorAction SilentlyContinue
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: windows-upgrade-smoke-receipt
+          path: |
+            upgrade-summary.json
+            old-server.log
+            old-server.err.log
+            new-server.log
+            new-server.err.log
+          if-no-files-found: warn
