@@ -44,12 +44,21 @@ jobs:
             Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/settings/upgrade-smoke' -ContentType 'application/json' -Body '{"sentinel":"setting-preserved"}' | Out-Null
             $count = Invoke-RestMethod 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events/count'
             if ($count -ne 2) { throw "v0.13.2 event count was $count, expected 2" }
-            # v0.13.2 batches event/settings writes for up to 15 seconds. A
-            # clean process termination does not force that transaction to
-            # commit, so wait for the documented batch interval before stop.
-            Start-Sleep -Seconds 16
+            # Bulk up this real v4 datastore so the Windows v5 index rebuild
+            # measures a nontrivial profile rather than only schema migration.
+            @'
+import sqlite3, sys
+p = sys.argv[1]
+count = 250_000
+with sqlite3.connect(p) as db:
+    bucketrow = db.execute("SELECT id FROM buckets WHERE name='upgrade-smoke'").fetchone()[0]
+    base = 1_735_689_600_000_000_000
+    rows = ((bucketrow, base + i * 1_000_000_000, base + i * 1_000_000_000 + 500_000_000, '{"app":"bulk-sentinel","title":"preserve-bulk"}') for i in range(count))
+    db.executemany("INSERT INTO events(bucketrow,starttime,endtime,data) VALUES (?,?,?,?)", rows)
+print(count)
+'@ | python - $db
             $count = Invoke-RestMethod 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events/count'
-            if ($count -ne 2) { throw "v0.13.2 event count after commit window was $count, expected 2" }
+            if ($count -ne 250002) { throw "v0.13.2 bulk event count was $count, expected 250002" }
           } finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
@@ -80,14 +89,17 @@ jobs:
             $setting = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/settings/upgrade-smoke'
             if (-not $buckets.'upgrade-smoke') { throw 'bucket missing after upgrade' }
             if ($buckets.'upgrade-smoke'.data.sentinel -ne 'bucket-metadata') { throw 'bucket metadata missing after upgrade' }
-            if ($eventCount -ne 2) { throw "event count after upgrade was $eventCount, expected 2" }
-            $titles = @($events | ForEach-Object { $_.data.title } | Sort-Object)
+            if ($eventCount -ne 250002) { throw "event count after upgrade was $eventCount, expected 250002" }
+            $sentinelEvents = @(Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events?start=2026-01-01T00%3A00%3A00Z&end=2026-01-01T00%3A03%3A00Z')
+            $titles = @($sentinelEvents | ForEach-Object { $_.data.title } | Sort-Object)
             if ($titles -join ',' -ne 'before-upgrade,preserve-me') { throw "event payloads changed after upgrade: $($titles -join ',')" }
             if ($setting.sentinel -ne 'setting-preserved') { throw 'setting missing after upgrade' }
             $summary = [ordered]@{
               old_version = 'v0.13.2'
               new_version = 'v0.14.0b5'
-              windows_runner = $env:RUNNER_IMAGE
+              runner_os = $env:RUNNER_OS
+              runner_arch = $env:RUNNER_ARCH
+              image_os = $env:ImageOS
               migration_ms = [math]::Round($elapsed)
               old_db_bytes = [int64]$env:OLD_DB_BYTES
               new_db_bytes = (Get-Item $db).Length
