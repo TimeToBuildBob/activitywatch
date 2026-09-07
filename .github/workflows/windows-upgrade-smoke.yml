@@ -44,6 +44,12 @@ jobs:
             Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/settings/upgrade-smoke' -ContentType 'application/json' -Body '{"sentinel":"setting-preserved"}' | Out-Null
             $count = Invoke-RestMethod 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events/count'
             if ($count -ne 2) { throw "v0.13.2 event count was $count, expected 2" }
+            # v0.13.2 batches event/settings writes for up to 15 seconds. A
+            # clean process termination does not force that transaction to
+            # commit, so wait for the documented batch interval before stop.
+            Start-Sleep -Seconds 16
+            $count = Invoke-RestMethod 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events/count'
+            if ($count -ne 2) { throw "v0.13.2 event count after commit window was $count, expected 2" }
           } finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
