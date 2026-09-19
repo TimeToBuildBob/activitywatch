@@ -314,6 +314,92 @@ def test_newly_vendored_pin_keeps_the_commits_only_it_has(tmp_path):
     assert "chore: initial commit" not in out  # still not the whole history
 
 
+def test_commit_subject_with_tab_does_not_break_log_parsing(tmp_path):
+    repo = init(tmp_path, "repo")
+    base = short(repo)
+    commit(repo, "fix: preserve\tthe subject")
+
+    found = changelog._log_commits(
+        [(str(repo), (base, short(repo)))]
+    )
+
+    assert [msg for _, _, msg in found] == ["fix: preserve\tthe subject"]
+
+
+def test_uninitialized_new_submodule_is_not_logged_from_superproject(tmp_path):
+    child = init(tmp_path, "child")
+    parent = init(tmp_path, "parent")
+    add_submodule(parent, "child", at=short(child))
+    git(parent, "submodule", "deinit", "-f", "child")
+
+    repo = changelog.Repo(
+        name="child",
+        pointers=[
+            changelog.Pointer("parent", str(parent / "child"), ("", ""))
+        ],
+    )
+
+    out = changelog.summary_repo("Test", repo, FILTER_TYPES)
+
+    assert "chore: initial commit" not in out
+
+
+def test_repo_new_to_every_parent_keeps_full_history(tmp_path):
+    child = init(tmp_path, "child")
+    commit(child, "feat: new repo history")
+    parent_a = init(tmp_path, "parent-a")
+    parent_b = init(tmp_path, "parent-b")
+    add_submodule(parent_a, "child")
+    add_submodule(parent_b, "child")
+
+    repo = changelog.Repo(
+        name="child",
+        pointers=[
+            changelog.Pointer("parent-a", str(parent_a / "child"), ("", "")),
+            changelog.Pointer("parent-b", str(parent_b / "child"), ("", "")),
+        ],
+        pins=[
+            changelog.Pin("parent-a", str(parent_a / "child"), short(child)),
+            changelog.Pin("parent-b", str(parent_b / "child"), short(child)),
+        ],
+    )
+
+    out = changelog.summary_repo("Test", repo, FILTER_TYPES)
+
+    assert "feat: new repo history" in out
+    assert "chore: initial commit" in out
+
+
+def test_unresolvable_synthetic_adoption_range_gets_warning(monkeypatch, tmp_path):
+    repo_path = init(tmp_path, "repo")
+    base = short(repo_path)
+    newest = commit(repo_path, "feat: newest pin")
+    repo = changelog.Repo(
+        name="repo",
+        pointers=[
+            changelog.Pointer("existing", str(repo_path), (base, newest)),
+            changelog.Pointer("adopting", str(repo_path), ("", "")),
+        ],
+        pins=[
+            changelog.Pin("existing", str(repo_path), newest),
+            changelog.Pin("adopting", str(repo_path), "fffffff"),
+        ],
+    )
+    real_find = changelog._find_checkout
+
+    def fail_derived_range(paths, refs):
+        if tuple(refs) == (base, "fffffff"):
+            return None
+        return real_find(paths, refs)
+
+    monkeypatch.setattr(changelog, "_find_checkout", fail_derived_range)
+
+    out = changelog.summary_repo("Test", repo, FILTER_TYPES)
+
+    assert "Could not resolve" in out
+    assert "`adopting` → `fffffff`" in out
+
+
 def test_warning_survives_when_every_commit_is_filtered(tmp_path):
     # the only webui commit this release is a filtered one, and the parents disagree:
     # the section has nothing to list, but the mismatch still has to be reported

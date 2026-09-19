@@ -390,7 +390,8 @@ def _resolve_ranges(
     for pointer in pointers:
         if pointer.commit_range in resolved:
             continue
-        path = _find_checkout([pointer.path] + checkouts, pointer.commit_range)
+        candidates = [pointer.path] if _is_checkout(pointer.path) else []
+        path = _find_checkout(candidates + checkouts, pointer.commit_range)
         if path is None:
             unresolved.append(pointer)
         else:
@@ -418,7 +419,7 @@ def _log_commits(
             f"git log {rev} --no-decorate --pretty={pretty}", cwd=path
         ).split("\n"):
             if line:
-                _id, timestamp, _author, email, msg = line.split("\t")
+                _id, timestamp, _author, email, msg = line.split("\t", 4)
                 commits.setdefault(_id, (int(timestamp), _id, email, msg))
 
     found = list(commits.values())
@@ -489,10 +490,13 @@ def summary_repo(org: str, repo: Repo, filter_types: List[str]) -> str:
         # unbounded replays the whole history. Bound each pin by where the parents that
         # already had the repo started, so that commits only the new pin has are still
         # covered. A repo that is new to every parent still lists everything.
-        starts = [since for _, (since, _) in bounded] or [
-            pin.commit for pin in repo.pins
-        ]
-        if len(starts) > 1 or bounded:
+        starts = [since for _, (since, _) in bounded]
+        if not starts and repo.out_of_sync:
+            # No parent moved the repo, but at least one existing parent still pins an
+            # older commit. That oldest pin is the adoption boundary. Equal pins mean
+            # the repo is new to every parent, so its full history remains intentional.
+            starts = [pin.commit for pin in repo.pins]
+        if starts:
             logger.info(
                 f"{repo.name} was newly added by a parent, bounding its history"
             )
@@ -502,10 +506,16 @@ def summary_repo(org: str, repo: Repo, filter_types: List[str]) -> str:
             for pin in repo.pins:
                 if pin.commit in covered:
                     continue
-                path = _find_checkout([pin.path] + checkouts, (base, pin.commit))
+                candidates = [pin.path] if _is_checkout(pin.path) else []
+                path = _find_checkout(candidates + checkouts, (base, pin.commit))
                 if path:
                     bounded.append((path, (base, pin.commit)))
+                else:
+                    unresolved.append(
+                        Pointer(pin.parent, pin.path, (base, pin.commit))
+                    )
             ranges = bounded
+            notes = _sync_notes(repo, unresolved)
 
     out = f"\n## 📦 {repo.name}" + notes
 
