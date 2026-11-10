@@ -156,3 +156,63 @@ jobs:
             new-server.log
             new-server.err.log
           if-no-files-found: warn
+
+  # Lives in this file because workflow_dispatch only sees workflow files on
+  # the default branch. Launch-only: proves the published bundle starts and
+  # serves the API on a real macOS GUI session. It cannot click the menu bar
+  # (ActivityWatch/activitywatch#1324 stays reporter-gated) and does not grant
+  # Accessibility, so watcher liveness is reported, not asserted.
+  macos-launch-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      TO_TAG: ${{ inputs.to_tag }}
+    steps:
+      - name: Launch published macOS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch=$(uname -m); [ "$arch" = arm64 ] || arch=x86_64
+          curl -fsSL -o aw.zip "https://github.com/ActivityWatch/activitywatch/releases/download/$TO_TAG/activitywatch-$TO_TAG-macos-$arch.zip"
+          ditto -x -k aw.zip extracted
+          app=$(find extracted -maxdepth 3 -name '*.app' -type d | head -1)
+          [ -n "$app" ] || { find extracted -maxdepth 3; exit 1; }
+          echo "bundle: $app"
+          open "$app"
+          ok=""
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:5600/api/0/info > info.json 2>/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          ps -axo pid,etime,command | grep -E 'aw-(qt|server|watcher)' | grep -v grep | tee procs-start.txt || true
+          [ -n "$ok" ] || { echo "aw-server never answered on :5600"; exit 1; }
+          sleep 30
+          ps -axo pid,etime,command | grep -E 'aw-(qt|server|watcher)' | grep -v grep | tee procs-30s.txt || true
+          grep -q 'aw-qt' procs-30s.txt || { echo "aw-qt not alive 30s after launch"; exit 1; }
+          curl -fsS http://127.0.0.1:5600/api/0/info > info-30s.json
+          python3 - "$TO_TAG" "$arch" <<'PY' | tee launch-summary.json
+          import json, sys
+          tag, arch = sys.argv[1:]
+          procs = open("procs-30s.txt").read()
+          print(json.dumps({
+              "tag": tag, "arch": arch,
+              "server_reports": json.load(open("info-30s.json")).get("version"),
+              "alive_after_30s": {n: n in procs for n in ["aw-qt", "aw-server", "aw-watcher-afk", "aw-watcher-window"]},
+          }, indent=2))
+          PY
+          { echo "### macOS launch smoke $TO_TAG"; echo '```json'; cat launch-summary.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p receipt
+          cp -f info*.json procs-*.txt launch-summary.json receipt/ 2>/dev/null || true
+          cp -R "$HOME/Library/Logs/activitywatch" receipt/logs 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: macos-launch-smoke-${{ inputs.to_tag }}
+          path: receipt
+          if-no-files-found: warn
