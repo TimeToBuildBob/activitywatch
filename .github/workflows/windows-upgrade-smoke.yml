@@ -1,7 +1,23 @@
-name: Windows v0.13.2 to v0.14.0b5 upgrade smoke
+name: Windows released-artifact upgrade smoke
+
+# Verifies a *published* Windows release zip on a GitHub-hosted runner:
+# seed a datastore with `from_tag`'s aw-server-rust, then start `to_tag`'s
+# aw-server-rust on the same file and check buckets, events, payloads and
+# settings survive. Covers the server/data path only (no aw-qt tray, no
+# installer, no real desktop session).
 
 on:
   workflow_dispatch:
+    inputs:
+      from_tag:
+        description: Release tag that creates the datastore
+        default: v0.13.2
+      to_tag:
+        description: Release tag that must open it
+        default: v0.14.2
+      bulk_events:
+        description: Extra rows inserted directly so the upgrade has a nontrivial profile
+        default: '250000'
 
 permissions:
   contents: read
@@ -10,30 +26,35 @@ jobs:
   upgrade-smoke:
     runs-on: windows-latest
     timeout-minutes: 20
+    env:
+      FROM_TAG: ${{ inputs.from_tag }}
+      TO_TAG: ${{ inputs.to_tag }}
+      BULK_EVENTS: ${{ inputs.bulk_events }}
     steps:
       - name: Download release archives
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest 'https://github.com/ActivityWatch/activitywatch/releases/download/v0.13.2/activitywatch-v0.13.2-windows-x86_64.zip' -OutFile old.zip
-          Invoke-WebRequest 'https://github.com/ActivityWatch/activitywatch/releases/download/v0.14.0b5/activitywatch-v0.14.0b5-windows-x86_64.zip' -OutFile new.zip
-          Expand-Archive old.zip -DestinationPath old
-          Expand-Archive new.zip -DestinationPath new
+          foreach ($pair in @(@('old', $env:FROM_TAG), @('new', $env:TO_TAG))) {
+            $dir, $tag = $pair
+            $url = "https://github.com/ActivityWatch/activitywatch/releases/download/$tag/activitywatch-$tag-windows-x86_64.zip"
+            Invoke-WebRequest $url -OutFile "$dir.zip"
+            Expand-Archive "$dir.zip" -DestinationPath $dir
+          }
 
-      - name: Create v4 datastore with v0.13.2 Windows binary
+      - name: Seed datastore with from_tag binary
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $db = Join-Path $PWD 'upgrade.sqlite.db'
           $old = Join-Path $PWD 'old/activitywatch/aw-server-rust/aw-server-rust.exe'
-          $log = Join-Path $PWD 'old-server.log'
-          $p = Start-Process $old -ArgumentList '--dbpath', $db, '--host', '127.0.0.1', '--port', '5667', '--no-legacy-import' -PassThru -RedirectStandardOutput $log -RedirectStandardError old-server.err.log
+          $p = Start-Process $old -ArgumentList '--dbpath', $db, '--host', '127.0.0.1', '--port', '5667', '--no-legacy-import' -PassThru -RedirectStandardOutput old-server.log -RedirectStandardError old-server.err.log
           try {
             $ready = $false
             foreach ($i in 1..120) {
               try { Invoke-RestMethod 'http://127.0.0.1:5667/api/0/info' | Out-Null; $ready = $true; break } catch { Start-Sleep -Milliseconds 250 }
             }
-            if (-not $ready) { throw "v0.13.2 server failed to start`n$(Get-Content old-server.err.log -Raw)" }
+            if (-not $ready) { throw "$env:FROM_TAG server failed to start`n$(Get-Content old-server.err.log -Raw)" }
             $bucket = @{ id='upgrade-smoke'; type='currentwindow'; client='upgrade-smoke'; hostname='windows-runner'; data=@{sentinel='bucket-metadata'} } | ConvertTo-Json -Depth 4
             Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke' -ContentType 'application/json' -Body $bucket | Out-Null
             $events = @(
@@ -43,75 +64,82 @@ jobs:
             Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events' -ContentType 'application/json' -Body $events | Out-Null
             Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/settings/upgrade-smoke' -ContentType 'application/json' -Body '{"sentinel":"setting-preserved"}' | Out-Null
             $count = Invoke-RestMethod 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke/events/count'
-            if ($count -ne 2) { throw "v0.13.2 event count was $count, expected 2" }
-            # v0.13.2 batches event/settings writes for up to 15 seconds.
-            Start-Sleep -Seconds 16
+            if ($count -ne 2) { throw "$env:FROM_TAG event count was $count, expected 2" }
+            # The datastore worker batches writes in one transaction and only
+            # decides to commit after handling a request; sleeping alone never
+            # flushes it, and the force-kill below would drop the batch
+            # (2026-09-07 runs lost both sentinels this way). CreateBucket
+            # forces an immediate commit of everything pending.
+            $flush = @{ id='upgrade-smoke-flush'; type='flush'; client='upgrade-smoke'; hostname='windows-runner' } | ConvertTo-Json
+            Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:5667/api/0/buckets/upgrade-smoke-flush' -ContentType 'application/json' -Body $flush | Out-Null
+            Start-Sleep -Seconds 1
           } finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
           }
-          # Bulk up the committed real v4 datastore so the Windows v5 index
-          # rebuild measures a nontrivial profile rather than only schema migration.
+          # Verify the seed is on disk before blaming the upgrade for anything,
+          # then bulk up the datastore so the upgrade measures a real profile.
           $py = @(
             'import sqlite3, sys',
-            'p = sys.argv[1]',
-            'count = 250_000',
+            'p, count = sys.argv[1], int(sys.argv[2])',
             'with sqlite3.connect(p) as db:',
             '    bucketrow = db.execute("SELECT id FROM buckets WHERE name=''upgrade-smoke''").fetchone()[0]',
+            '    seeded = db.execute("SELECT COUNT(*) FROM events WHERE bucketrow=?", (bucketrow,)).fetchone()[0]',
+            '    if seeded != 2: sys.exit(f"seed not committed: {seeded} events on disk, expected 2")',
             '    base = 1_735_689_600_000_000_000',
             '    rows = ((bucketrow, base + i * 1_000_000_000, base + i * 1_000_000_000 + 500_000_000, ''{"app":"bulk-sentinel","title":"preserve-bulk"}'') for i in range(count))',
             '    db.executemany("INSERT INTO events(bucketrow,starttime,endtime,data) VALUES (?,?,?,?)", rows)',
             'print(count)'
           ) -join "`n"
-          $py | python - $db
-          if (-not (Test-Path $db)) { throw 'v0.13.2 did not create datastore' }
+          $py | python - $db $env:BULK_EVENTS
+          if ($LASTEXITCODE -ne 0) { throw 'datastore seed verification failed' }
           "OLD_DB_BYTES=$((Get-Item $db).Length)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upgrade same datastore with v0.14.0b5 Windows binary
+      - name: Open same datastore with to_tag binary
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $db = Join-Path $PWD 'upgrade.sqlite.db'
           $new = Join-Path $PWD 'new/activitywatch/aw-server-rust/aw-server-rust.exe'
-          $out = Join-Path $PWD 'new-server.log'
           $err = Join-Path $PWD 'new-server.err.log'
+          $expected = [int64]$env:BULK_EVENTS + 2
           $started = Get-Date
-          $p = Start-Process $new -ArgumentList '--dbpath', $db, '--host', '127.0.0.1', '--port', '5668', '--no-legacy-import' -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          $p = Start-Process $new -ArgumentList '--dbpath', $db, '--host', '127.0.0.1', '--port', '5668', '--no-legacy-import' -PassThru -RedirectStandardOutput new-server.log -RedirectStandardError $err
           try {
             $ready = $false
             foreach ($i in 1..240) {
               try { Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/' | Out-Null; $ready = $true; break } catch { Start-Sleep -Milliseconds 250 }
             }
-            if (-not $ready) { throw "v0.14.0b5 server failed to expose buckets`n$(Get-Content $err -Raw)" }
+            if (-not $ready) { throw "$env:TO_TAG server failed to expose buckets`n$(Get-Content $err -Raw)" }
             $elapsed = ((Get-Date) - $started).TotalMilliseconds
+            $info = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/info'
             $buckets = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/'
-            $events = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events'
             $eventCount = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events/count'
             $setting = Invoke-RestMethod 'http://127.0.0.1:5668/api/0/settings/upgrade-smoke'
             if (-not $buckets.'upgrade-smoke') { throw 'bucket missing after upgrade' }
             if ($buckets.'upgrade-smoke'.data.sentinel -ne 'bucket-metadata') { throw 'bucket metadata missing after upgrade' }
-            if ($eventCount -ne 250002) { throw "event count after upgrade was $eventCount, expected 250002" }
+            if ($eventCount -ne $expected) { throw "event count after upgrade was $eventCount, expected $expected" }
             $sentinelEvents = @(Invoke-RestMethod 'http://127.0.0.1:5668/api/0/buckets/upgrade-smoke/events?start=2026-01-01T00%3A00%3A00Z&end=2026-01-01T00%3A03%3A00Z')
             $titles = @($sentinelEvents | ForEach-Object { $_.data.title } | Sort-Object)
             if ($titles -join ',' -ne 'before-upgrade,preserve-me') { throw "event payloads changed after upgrade: $($titles -join ',')" }
             if ($setting.sentinel -ne 'setting-preserved') { throw 'setting missing after upgrade' }
             $summary = [ordered]@{
-              old_version = 'v0.13.2'
-              new_version = 'v0.14.0b5'
+              old_version = $env:FROM_TAG
+              new_version = $env:TO_TAG
+              new_server_reports = $info.version
               runner_os = $env:RUNNER_OS
               runner_arch = $env:RUNNER_ARCH
               image_os = $env:ImageOS
-              migration_ms = [math]::Round($elapsed)
+              startup_ms = [math]::Round($elapsed)
               old_db_bytes = [int64]$env:OLD_DB_BYTES
               new_db_bytes = (Get-Item $db).Length
-              bucket_preserved = $true
               bucket_metadata_preserved = $true
               events_preserved = $eventCount
               event_payloads_preserved = $true
               setting_preserved = $true
             }
             $summary | ConvertTo-Json | Tee-Object upgrade-summary.json
-            Get-Content $err -ErrorAction SilentlyContinue
+            "### Upgrade smoke $env:FROM_TAG -> $env:TO_TAG`n``````json`n$(Get-Content upgrade-summary.json -Raw)`n``````" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           } finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
@@ -120,7 +148,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: windows-upgrade-smoke-receipt
+          name: windows-upgrade-smoke-${{ inputs.from_tag }}-to-${{ inputs.to_tag }}
           path: |
             upgrade-summary.json
             old-server.log
