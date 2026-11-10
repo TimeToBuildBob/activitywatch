@@ -173,10 +173,15 @@ jobs:
         run: |
           set -euo pipefail
           arch=$(uname -m); [ "$arch" = arm64 ] || arch=x86_64
-          curl -fsSL -o aw.zip "https://github.com/ActivityWatch/activitywatch/releases/download/$TO_TAG/activitywatch-$TO_TAG-macos-$arch.zip"
-          ditto -x -k aw.zip extracted
-          app=$(find extracted -maxdepth 3 -name '*.app' -type d | head -1)
-          [ -n "$app" ] || { find extracted -maxdepth 3; exit 1; }
+          # The .zip is a bare activitywatch/ directory; users install the
+          # .app from the .dmg, so test that.
+          curl -fsSL -o aw.dmg "https://github.com/ActivityWatch/activitywatch/releases/download/$TO_TAG/activitywatch-$TO_TAG-macos-$arch.dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$PWD/mnt" aw.dmg
+          src=$(find mnt -maxdepth 2 -name '*.app' -type d | head -1)
+          [ -n "$src" ] || { ls -la mnt; exit 1; }
+          mkdir -p installed && cp -R "$src" installed/
+          hdiutil detach mnt
+          app="installed/$(basename "$src")"
           echo "bundle: $app"
           open "$app"
           ok=""
